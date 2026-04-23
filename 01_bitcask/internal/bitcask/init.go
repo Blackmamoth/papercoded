@@ -334,12 +334,16 @@ func (b *Bitcask) initializeKeydir(files []os.DirEntry) error {
 
 			valueOffset := offset + 20 + klen
 
-			b.keydir.Set(key, KeydirEntry{
-				fileID:      file.Name(),
-				valueOffset: valueOffset,
-				valueSize:   vlen,
-				timestamp:   int64(binary.LittleEndian.Uint64(header[4:12])),
-			})
+			if vlen == 0 {
+				delete(b.keydir, key)
+			} else {
+				b.keydir.Set(key, KeydirEntry{
+					fileID:      file.Name(),
+					valueOffset: valueOffset,
+					valueSize:   vlen,
+					timestamp:   int64(binary.LittleEndian.Uint64(header[4:12])),
+				})
+			}
 
 			slog.Info("SET key [%s] in keydir", "key", key)
 
