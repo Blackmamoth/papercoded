@@ -145,38 +145,16 @@ func (b *Bitcask) Put(key, value string) error {
 	b.mutex.Lock()
 	defer b.mutex.Unlock()
 
-	ts := time.Now().UnixNano()
-	encodedByte := encodeRecord(key, value, ts)
-
-	currentOffset := b.ActiveFileSize
-
-	n, err := b.activeFileHandle.Write(encodedByte)
+	entry, err := b.appendRecord(key, value)
 
 	if err != nil {
-		slog.Error("failed to write to active data file", "error", err)
-		return err
+		slog.Error("failed to append record to current active data file", "key", key, "value", value, "active_file_id", b.ActiveFileID)
+		return fmt.Errorf("failed to append record for key %s: %v", key, err)
 	}
 
-	if n < len(encodedByte) {
+	b.keydir.Set(key, entry)
 
-		if err := b.Close(); err != nil {
-			slog.Error("failed to close current active data file on partial write detection", "error", err)
-		}
-
-		slog.Error("partial write detected while appending to active data file")
-		return fmt.Errorf("partial write detected while appending to active data file")
-	}
-
-	b.keydir.Set(key, KeydirEntry{
-		fileID:      b.ActiveFileID,
-		valueOffset: currentOffset + 20 + int64(len(key)),
-		valueSize:   int64(len(value)),
-		timestamp:   ts,
-	})
-
-	slog.Info("SET key [%s] in keydir", "key", key)
-
-	b.ActiveFileSize += int64(n)
+	slog.Info("set key in keydir", "key", key)
 
 	return nil
 }
@@ -213,6 +191,31 @@ func (b *Bitcask) Get(key string) (string, bool, error) {
 	}
 
 	return string(valueBuf), true, nil
+}
+
+func (b *Bitcask) Delete(key string) error {
+
+	b.mutex.Lock()
+	defer b.mutex.Unlock()
+
+	_, ok := b.keydir.Get(key)
+	if !ok {
+		slog.Error("attempted to delete non-existent key", "key", key)
+		return fmt.Errorf("attempated to delete non-existent key [%s]", key)
+	}
+
+	_, err := b.appendRecord(key, "")
+
+	if err != nil {
+		slog.Error("failed to append record to current active data file", "key", key, "value", "<EMPTY>", "active_file_id", b.ActiveFileID)
+		return fmt.Errorf("failed to append record for key %s: %v", key, err)
+	}
+
+	delete(b.keydir, key)
+
+	slog.Info("DELETE key from keydir", "key", key)
+
+	return nil
 }
 
 func (b *Bitcask) Close() error {
@@ -353,4 +356,36 @@ func (b *Bitcask) initializeKeydir(files []os.DirEntry) error {
 	}
 
 	return nil
+}
+
+func (b *Bitcask) appendRecord(key, value string) (KeydirEntry, error) {
+	ts := time.Now().UnixNano()
+	encodedByte := encodeRecord(key, value, ts)
+
+	currentOffset := b.ActiveFileSize
+
+	n, err := b.activeFileHandle.Write(encodedByte)
+	if err != nil {
+		slog.Error("failed to write to active data file", "error", err)
+		return KeydirEntry{}, err
+	}
+
+	if n < len(encodedByte) {
+		if err := b.Close(); err != nil {
+			slog.Error("failed to close current active data file on partial write detection", "error", err)
+		}
+		slog.Error("partial write detected while appending to active data file")
+		return KeydirEntry{}, fmt.Errorf("partial write detected while appending to active data file")
+	}
+
+	b.ActiveFileSize += int64(n)
+
+	entry := KeydirEntry{
+		fileID:      b.ActiveFileID,
+		valueOffset: currentOffset + 20 + int64(len(key)),
+		valueSize:   int64(len(value)),
+		timestamp:   ts,
+	}
+
+	return entry, nil
 }
