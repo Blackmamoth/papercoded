@@ -1,0 +1,26 @@
+package main
+
+import (
+	"fmt"
+	"log"
+	"log/slog"
+
+	"github.com/blackmamoth/bitcask/internal/bitcask"
+)
+
+func main() {
+
+	bitcask, err := bitcask.NewBitcask(".", 1)
+	if err != nil {
+		log.Fatalf("failed to instantiate bitcask instance: %v", err)
+	}
+
+	defer bitcask.Close()
+
+	for i := range 10 {
+		bitcask.Put(fmt.Sprintf("foo%d", i), fmt.Sprintf("bar%d", i))
+	}
+
+	val, _, _ := bitcask.Get("foo3")
+	slog.Info("retrieved value for key", "key", "foo3", "value", val)
+}
