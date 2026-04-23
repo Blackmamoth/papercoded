@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"log"
 	"log/slog"
 	"os"
@@ -21,15 +22,15 @@ func main() {
 
 	defer bitcask.Close()
 
-	// for i := range 10 {
-	// 	bitcask.Put(fmt.Sprintf("foo%d", i), fmt.Sprintf("bar%d", i))
-	// }
+	bitcask.Merge()
+
+	for i := range 15 {
+		bitcask.Put(fmt.Sprintf("foo%d", i), fmt.Sprintf("bar%d", i))
+	}
 
 	// val, ok, _ := bitcask.Get("foo3")
 	// slog.Info("retrieved value for key", "key", "foo3", "value", val, "ok", ok)
 
-	// bitcask.Delete("foo3")
-
-	val, ok, _ := bitcask.Get("foo3")
-	slog.Info("retrieved value for key", "key", "foo3", "value", val, "ok", ok)
+	// val, ok, _ = bitcask.Get("foo3")
+	// slog.Info("retrieved value for key", "key", "foo3", "value", val, "ok", ok)
 }

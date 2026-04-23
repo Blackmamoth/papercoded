@@ -4,6 +4,10 @@ import (
 	"encoding/binary"
 	"fmt"
 	"hash/crc32"
+	"log/slog"
+	"os"
+	"sort"
+	"strings"
 )
 
 func encodeRecord(key, value string, ts int64) []byte {
@@ -59,4 +63,62 @@ func decodeRecord(buf []byte) (key, value string, ts int64, err error) {
 	value = string(buf[keyEnd:valEnd])
 
 	return key, value, ts, nil
+}
+
+func writeRecord(
+	f *os.File,
+	fileID string,
+	currentOffset int64,
+	ts int64,
+	key, value string,
+) (KeydirEntry, int64, error) {
+
+	encoded := encodeRecord(key, value, ts)
+
+	n, err := f.Write(encoded)
+	if err != nil {
+		slog.Error("failed to write record to file", "file_id", fileID, "error", err)
+		return KeydirEntry{}, 0, err
+	}
+
+	if n < len(encoded) {
+		slog.Error("partial write detected", "file_id", fileID)
+		return KeydirEntry{}, 0, fmt.Errorf("partial write detected")
+	}
+
+	entry := KeydirEntry{
+		fileID:      fileID,
+		valueOffset: currentOffset + 20 + int64(len(key)),
+		valueSize:   int64(len(value)),
+		timestamp:   ts,
+	}
+
+	return entry, int64(n), nil
+}
+
+func listDataFiles(dirPath string) ([]os.DirEntry, error) {
+	files, err := os.ReadDir(dirPath)
+	if err != nil {
+		slog.Error("error reading bitcask directory", "error", err)
+		return nil, err
+	}
+
+	n := 0
+
+	for _, file := range files {
+		if !file.IsDir() && strings.HasSuffix(file.Name(), ".data") {
+			files[n] = file
+			n++
+		}
+	}
+
+	files = files[:n]
+
+	return files, nil
+}
+
+func sortDataFilesByName(files []os.DirEntry) {
+	sort.Slice(files, func(i, j int) bool {
+		return files[i].Name() < files[j].Name()
+	})
 }

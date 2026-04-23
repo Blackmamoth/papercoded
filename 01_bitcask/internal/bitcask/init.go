@@ -7,7 +7,6 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
-	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -53,9 +52,9 @@ func (b *Bitcask) Open() error {
 			return
 		}
 
-		files, err := os.ReadDir(b.dirPath)
+		files, err := listDataFiles(b.dirPath)
 		if err != nil {
-			slog.Error("error reading bitcask directory", "error", err)
+			slog.Error("failed to list data files from bitcask directory", "error", err)
 			openErr = err
 			return
 		}
@@ -63,29 +62,11 @@ func (b *Bitcask) Open() error {
 		if len(files) == 0 {
 			b.counter = 0
 			if err := b.createNewActiveFile(); err != nil {
+				slog.Error("failed to create new data file in bitcask directory", "error", err)
 				openErr = err
 				return
 			}
 		} else {
-
-			n := 0
-
-			for _, file := range files {
-				if !file.IsDir() && strings.HasSuffix(file.Name(), ".data") {
-					files[n] = file
-					n++
-				}
-			}
-
-			files = files[:n]
-
-			if len(files) == 0 {
-				slog.Info("No data files found in the Bitcask directory, creating new data file")
-
-				b.counter = 0
-				openErr = b.createNewActiveFile()
-				return
-			}
 
 			if err := b.initializeKeydir(files); err != nil {
 				slog.Error("failed to initialize keydir", "error", err)
@@ -93,46 +74,16 @@ func (b *Bitcask) Open() error {
 				return
 			}
 
-			sort.Slice(files, func(i, j int) bool {
-				return files[i].Name() < files[j].Name()
-			})
+			sortDataFilesByName(files)
 
-			activeFile := files[len(files)-1]
+			latestFile := files[len(files)-1]
 
-			b.counter, err = b.getLatestCount(activeFile)
-			if err != nil {
-				slog.Error("failed to get latest file id", "error", err)
+			b.counter, err = b.getCountFromFileName(latestFile.Name())
+
+			if err := b.createNewActiveFile(); err != nil {
+				slog.Error("failed to create new data file in bitcask directory", "error", err)
 				openErr = err
 				return
-			}
-
-			activeFileInfo, err := activeFile.Info()
-			if err != nil {
-				slog.Error("failed to retrieve stats for current active data file in bitcask directory", "error", err)
-				openErr = err
-				return
-			}
-
-			activeFileSize := activeFileInfo.Size()
-
-			b.ActiveFileSize = activeFileSize
-
-			if activeFileSize >= b.maxFileSize {
-				if err := b.createNewActiveFile(); err != nil {
-					openErr = err
-					return
-				}
-			} else {
-
-				file, err := os.OpenFile(filepath.Join(b.dirPath, activeFile.Name()), os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
-				if err != nil {
-					slog.Error("failed to open active data file in bitcask directory", "error", err)
-					openErr = err
-					return
-				}
-
-				b.activeFileHandle = file
-				b.ActiveFileID = activeFile.Name()
 			}
 		}
 	})
@@ -218,6 +169,115 @@ func (b *Bitcask) Delete(key string) error {
 	return nil
 }
 
+func (b *Bitcask) Merge() error {
+	b.mutex.Lock()
+	defer b.mutex.Unlock()
+
+	openFileHandles := make(map[string]*os.File)
+
+	newKeyDir := make(Keydir)
+
+	latestCounter := b.counter + 1
+	newMergeFiles := make(map[string]struct{})
+
+	var mergeFileHandle *os.File
+	currentMergeFileName := fmt.Sprintf("%020d.data", latestCounter)
+	var currentMergeFileSize int64
+
+	for key, entry := range b.keydir {
+		fileID := entry.fileID
+
+		if fileID == b.ActiveFileID {
+			newKeyDir.Set(key, entry)
+			continue
+		}
+
+		fileHandle, ok := openFileHandles[fileID]
+		if !ok {
+			fh, err := os.Open(filepath.Join(b.dirPath, fileID))
+			if err != nil {
+				return err
+			}
+			fileHandle = fh
+			openFileHandles[fileID] = fileHandle
+		}
+
+		valueBuf := make([]byte, entry.valueSize)
+
+		if _, err := fileHandle.Seek(entry.valueOffset, io.SeekStart); err != nil {
+			return err
+		}
+
+		if _, err := io.ReadFull(fileHandle, valueBuf); err != nil {
+			return err
+		}
+
+		if mergeFileHandle == nil || currentMergeFileSize >= b.maxFileSize {
+			if mergeFileHandle != nil {
+				mergeFileHandle.Close()
+			}
+
+			currentMergeFileName = fmt.Sprintf("%020d.data", latestCounter)
+
+			fh, err := os.OpenFile(
+				filepath.Join(b.dirPath, currentMergeFileName),
+				os.O_APPEND|os.O_CREATE|os.O_WRONLY,
+				0644,
+			)
+			if err != nil {
+				return err
+			}
+
+			mergeFileHandle = fh
+			newMergeFiles[currentMergeFileName] = struct{}{}
+			currentMergeFileSize = 0
+			latestCounter++
+		}
+
+		newEntry, written, err := writeRecord(
+			mergeFileHandle,
+			currentMergeFileName,
+			currentMergeFileSize,
+			entry.timestamp,
+			key,
+			string(valueBuf),
+		)
+		if err != nil {
+			return err
+		}
+
+		currentMergeFileSize += written
+		newKeyDir.Set(key, newEntry)
+	}
+
+	for _, fileHandle := range openFileHandles {
+		fileHandle.Close()
+	}
+
+	if mergeFileHandle != nil {
+		mergeFileHandle.Close()
+	}
+
+	allDataFiles, err := listDataFiles(b.dirPath)
+	if err == nil {
+		for _, file := range allDataFiles {
+			name := file.Name()
+			if name == b.ActiveFileID {
+				continue
+			}
+			if _, ok := newMergeFiles[name]; ok {
+				continue
+			}
+			_ = os.Remove(filepath.Join(b.dirPath, name))
+		}
+	}
+
+	b.keydir = newKeyDir
+	b.counter = latestCounter - 1
+
+	return nil
+}
+
 func (b *Bitcask) Close() error {
 	if b.activeFileHandle == nil {
 		return nil
@@ -282,10 +342,9 @@ func (b *Bitcask) createNewActiveFile() error {
 	return nil
 }
 
-func (b *Bitcask) getLatestCount(dirEntry os.DirEntry) (uint64, error) {
-	name := dirEntry.Name()
+func (b *Bitcask) getCountFromFileName(fileName string) (uint64, error) {
 
-	name = strings.TrimSuffix(name, ".data")
+	name := strings.TrimSuffix(fileName, ".data")
 
 	id, err := strconv.ParseUint(name, 10, 64)
 	if err != nil {
@@ -345,7 +404,7 @@ func (b *Bitcask) initializeKeydir(files []os.DirEntry) error {
 				})
 			}
 
-			slog.Info("SET key [%s] in keydir", "key", key)
+			slog.Info("SET key in keydir", "key", key)
 
 			if _, err := f.Seek(vlen, io.SeekCurrent); err != nil {
 				slog.Error("failed to skip value offset", "file_name", file.Name(), "error", err)
@@ -363,33 +422,35 @@ func (b *Bitcask) initializeKeydir(files []os.DirEntry) error {
 }
 
 func (b *Bitcask) appendRecord(key, value string) (KeydirEntry, error) {
+	// encodedByte := encodeRecord(key, value, ts)
+
+	// currentOffset := b.ActiveFileSize
+
+	// n, err := b.activeFileHandle.Write(encodedByte)
+	// if err != nil {
+	// 	slog.Error("failed to write to active data file", "error", err)
+	// 	return KeydirEntry{}, err
+	// }
+
+	// if n < len(encodedByte) {
+	// 	if err := b.Close(); err != nil {
+	// 		slog.Error("failed to close current active data file on partial write detection", "error", err)
+	// 	}
+	// 	slog.Error("partial write detected while appending to active data file")
+	// 	return KeydirEntry{}, fmt.Errorf("partial write detected while appending to active data file")
+	// }
+
+	// b.ActiveFileSize += int64(n)
+
+	// entry := KeydirEntry{
+	// 	fileID:      b.ActiveFileID,
+	// 	valueOffset: currentOffset + 20 + int64(len(key)),
+	// 	valueSize:   int64(len(value)),
+	// 	timestamp:   ts,
+	// }
+
+	// return entry, nil
 	ts := time.Now().UnixNano()
-	encodedByte := encodeRecord(key, value, ts)
-
-	currentOffset := b.ActiveFileSize
-
-	n, err := b.activeFileHandle.Write(encodedByte)
-	if err != nil {
-		slog.Error("failed to write to active data file", "error", err)
-		return KeydirEntry{}, err
-	}
-
-	if n < len(encodedByte) {
-		if err := b.Close(); err != nil {
-			slog.Error("failed to close current active data file on partial write detection", "error", err)
-		}
-		slog.Error("partial write detected while appending to active data file")
-		return KeydirEntry{}, fmt.Errorf("partial write detected while appending to active data file")
-	}
-
-	b.ActiveFileSize += int64(n)
-
-	entry := KeydirEntry{
-		fileID:      b.ActiveFileID,
-		valueOffset: currentOffset + 20 + int64(len(key)),
-		valueSize:   int64(len(value)),
-		timestamp:   ts,
-	}
-
-	return entry, nil
+	entry, _, err := writeRecord(b.activeFileHandle, b.ActiveFileID, b.ActiveFileSize, ts, key, value)
+	return entry, err
 }
