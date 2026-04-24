@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"maps"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -17,7 +18,7 @@ type Bitcask struct {
 	dirPath          string
 	maxFileSize      int64 // in MB
 	counter          uint64
-	mutex            sync.Mutex
+	mutex            sync.RWMutex
 	once             sync.Once
 	activeFileHandle *os.File
 	keydir           Keydir
@@ -125,7 +126,9 @@ func (b *Bitcask) Put(key, value string) error {
 
 func (b *Bitcask) Get(key string) (string, bool, error) {
 
+	b.mutex.RLock()
 	keydirEntry, ok := b.keydir.Get(key)
+	b.mutex.RUnlock()
 	if !ok {
 		slog.Warn("attempted to GET non-existent key", "key", key)
 		return "", false, nil
@@ -184,114 +187,37 @@ func (b *Bitcask) Delete(key string) error {
 
 func (b *Bitcask) Merge() error {
 	b.mutex.Lock()
+	keydirSnapshot := make(Keydir)
+	// for k, v := range b.keydir {
+	// 	keydirSnapshot[k] = v
+	// }
+	maps.Copy(keydirSnapshot, b.keydir)
+	activeID := b.ActiveFileID
+	counter := b.counter
+	b.mutex.Unlock()
+
+	newKeyDir, newMergeFiles, err := b.compactSnapshot(keydirSnapshot, activeID, counter)
+	if err != nil {
+		slog.Error("failed to compact snapshot during merge", "error", err)
+		return err
+	}
+
+	b.mutex.Lock()
 	defer b.mutex.Unlock()
 
-	openFileHandles := make(map[string]*os.File)
-
-	newKeyDir := make(Keydir)
-
-	latestCounter := b.counter + 1
-	newMergeFiles := make(map[string]struct{})
-
-	var mergeFileHandle *os.File
-	var hintFileHandle *os.File
-	currentMergeFileName := fmt.Sprintf("%020d.data", latestCounter)
-	var currentHintFileName string
-	var currentMergeFileSize int64
-
-	for key, entry := range b.keydir {
-		fileID := entry.fileID
-
-		if fileID == b.ActiveFileID {
-			newKeyDir.Set(key, entry)
-			continue
-		}
-
-		fileHandle, ok := openFileHandles[fileID]
-		if !ok {
-			fh, err := os.Open(filepath.Join(b.dirPath, fileID))
-			if err != nil {
-				return err
-			}
-			fileHandle = fh
-			openFileHandles[fileID] = fileHandle
-		}
-
-		valueBuf := make([]byte, entry.valueSize)
-
-		if _, err := fileHandle.Seek(entry.valueOffset, io.SeekStart); err != nil {
-			return err
-		}
-
-		if _, err := io.ReadFull(fileHandle, valueBuf); err != nil {
-			return err
-		}
-
-		if mergeFileHandle == nil || currentMergeFileSize >= b.maxFileSize {
-			if mergeFileHandle != nil {
-				mergeFileHandle.Close()
-			}
-
-			if hintFileHandle != nil {
-				hintFileHandle.Close()
-			}
-
-			currentMergeFileName = fmt.Sprintf("%020d.data", latestCounter)
-
-			fh, err := os.OpenFile(
-				filepath.Join(b.dirPath, currentMergeFileName),
-				os.O_APPEND|os.O_CREATE|os.O_WRONLY,
-				0644,
-			)
-			if err != nil {
-				slog.Error("failed to create merge file handle", "file_name", currentMergeFileName, "error", err)
-				return err
-			}
-
-			currentHintFileName = strings.Replace(currentMergeFileName, ".data", ".hint", 1)
-			hintFileHandle, err = os.OpenFile(filepath.Join(b.dirPath, currentHintFileName), os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
-			if err != nil {
-				slog.Error("failed to create merge file handle", "file_name", currentHintFileName, "error", err)
-				return err
-			}
-
-			mergeFileHandle = fh
-			newMergeFiles[currentMergeFileName] = struct{}{}
-			currentMergeFileSize = 0
-			latestCounter++
-		}
-
-		newEntry, written, err := writeRecord(
-			mergeFileHandle,
-			currentMergeFileName,
-			currentMergeFileSize,
-			entry.timestamp,
-			key,
-			string(valueBuf),
-		)
-		if err != nil {
-			return err
-		}
-
-		currentMergeFileSize += written
-		newKeyDir.Set(key, newEntry)
-
-		err = writeHintEntry(hintFileHandle, key, newEntry)
-		if err != nil {
-			slog.Error("failed to write to hint file")
+	for k, entry := range b.keydir {
+		// if v.fileID == activeID {
+		// 	newKeyDir[k] = entry
+		// }
+		if _, isMergeFile := newMergeFiles[entry.fileID]; !isMergeFile {
+			newKeyDir[k] = entry
 		}
 	}
 
-	for _, fileHandle := range openFileHandles {
-		fileHandle.Close()
-	}
-
-	if mergeFileHandle != nil {
-		mergeFileHandle.Close()
-	}
-
-	if hintFileHandle != nil {
-		hintFileHandle.Close()
+	for k := range keydirSnapshot {
+		if _, stillExists := b.keydir[k]; !stillExists {
+			delete(newKeyDir, k)
+		}
 	}
 
 	allDataFiles, err := listDataFiles(b.dirPath)
@@ -309,7 +235,10 @@ func (b *Bitcask) Merge() error {
 	}
 
 	b.keydir = newKeyDir
-	b.counter = latestCounter - 1
+	newCounter := counter + uint64(len(newMergeFiles))
+	if newCounter > b.counter {
+		b.counter = newCounter
+	}
 
 	return nil
 }
@@ -362,8 +291,19 @@ func (b *Bitcask) createNewActiveFile() error {
 	}
 
 	b.counter++
-	fileID := fmt.Sprintf("%020d", b.counter)
-	fileName := fmt.Sprintf("%s.data", fileID)
+	// fileID := fmt.Sprintf("%020d", b.counter)
+	// fileName := fmt.Sprintf("%s.data", fileID)
+
+	var fileName string
+
+	for {
+		fileName = fmt.Sprintf("%020d.data", b.counter)
+		_, err := os.Stat(filepath.Join(b.dirPath, fileName))
+		if os.IsNotExist(err) {
+			break
+		}
+		b.counter++
+	}
 
 	file, err := os.OpenFile(filepath.Join(b.dirPath, fileName), os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
 	if err != nil {
@@ -541,6 +481,19 @@ func (b *Bitcask) appendRecord(key, value string) (KeydirEntry, error) {
 		}
 	}
 
+	recordSize := int64(20 + len(key) + len(value))
+
+	if b.ActiveFileSize+recordSize > b.maxFileSize {
+		if err := b.Close(); err != nil {
+			slog.Error("failed to close active data file", "error", err)
+			return KeydirEntry{}, err
+		}
+		if err := b.createNewActiveFile(); err != nil {
+			slog.Error("failed to create an active data file in bitcask directory", "error", err)
+			return KeydirEntry{}, err
+		}
+	}
+
 	ts := time.Now().UnixNano()
 	entry, written, err := writeRecord(b.activeFileHandle, b.ActiveFileID, b.ActiveFileSize, ts, key, value)
 
@@ -626,4 +579,119 @@ func readHintEntry(r io.Reader, fileID string) (string, KeydirEntry, error) {
 	}
 
 	return string(keyBuf), entry, nil
+}
+
+func (b *Bitcask) compactSnapshot(snapshot Keydir, activeID string, counter uint64) (Keydir, map[string]struct{}, error) {
+	openFileHandles := make(map[string]*os.File)
+	newKeyDir := make(Keydir)
+	newMergeFiles := make(map[string]struct{})
+
+	latestCounter := counter + 1
+
+	var mergeFileHandle *os.File
+	var hintFileHandle *os.File
+	var currentMergeFileName string
+	var currentHintFileName string
+	var currentMergeFileSize int64
+
+	for key, entry := range snapshot {
+		if entry.fileID == activeID {
+			newKeyDir.Set(key, entry)
+			continue
+		}
+
+		fileHandle, ok := openFileHandles[entry.fileID]
+		if !ok {
+			fh, err := os.Open(filepath.Join(b.dirPath, entry.fileID))
+			if err != nil {
+				return nil, nil, err
+			}
+			fileHandle = fh
+			openFileHandles[entry.fileID] = fileHandle
+		}
+
+		valueBuf := make([]byte, entry.valueSize)
+
+		if _, err := fileHandle.Seek(entry.valueOffset, io.SeekStart); err != nil {
+			return nil, nil, err
+		}
+
+		if _, err := io.ReadFull(fileHandle, valueBuf); err != nil {
+			return nil, nil, err
+		}
+
+		if mergeFileHandle == nil || currentMergeFileSize >= b.maxFileSize {
+			if mergeFileHandle != nil {
+				mergeFileHandle.Close()
+			}
+
+			if hintFileHandle != nil {
+				hintFileHandle.Close()
+			}
+
+			currentMergeFileName = fmt.Sprintf("%020d.data", latestCounter)
+
+			fh, err := os.OpenFile(
+				filepath.Join(b.dirPath, currentMergeFileName),
+				os.O_APPEND|os.O_CREATE|os.O_WRONLY,
+				0644,
+			)
+			if err != nil {
+				slog.Error("failed to create merge file handle", "file_name", currentMergeFileName, "error", err)
+				return nil, nil, err
+			}
+
+			currentHintFileName = strings.Replace(currentMergeFileName, ".data", ".hint", 1)
+
+			hfh, err := os.OpenFile(
+				filepath.Join(b.dirPath, currentHintFileName),
+				os.O_APPEND|os.O_CREATE|os.O_WRONLY,
+				0644,
+			)
+			if err != nil {
+				slog.Error("failed to create hint file handle", "file_name", currentHintFileName, "error", err)
+				return nil, nil, err
+			}
+
+			mergeFileHandle = fh
+			hintFileHandle = hfh
+			newMergeFiles[currentMergeFileName] = struct{}{}
+			currentMergeFileSize = 0
+			latestCounter++
+		}
+
+		newEntry, written, err := writeRecord(
+			mergeFileHandle,
+			currentMergeFileName,
+			currentMergeFileSize,
+			entry.timestamp,
+			key,
+			string(valueBuf),
+		)
+		if err != nil {
+			return nil, nil, err
+		}
+
+		currentMergeFileSize += written
+		newKeyDir.Set(key, newEntry)
+
+		if err := writeHintEntry(hintFileHandle, key, newEntry); err != nil {
+			slog.Error("failed to write to hint file", "file_name", currentHintFileName, "error", err)
+			return nil, nil, err
+		}
+	}
+
+	for _, fh := range openFileHandles {
+		fh.Close()
+	}
+
+	if mergeFileHandle != nil {
+		mergeFileHandle.Close()
+	}
+
+	if hintFileHandle != nil {
+		hintFileHandle.Close()
+	}
+
+	return newKeyDir, newMergeFiles, nil
 }
