@@ -61,11 +61,14 @@ func (b *Bitcask) Open() error {
 
 		if len(files) == 0 {
 			b.counter = 0
-			if err := b.createNewActiveFile(); err != nil {
-				slog.Error("failed to create new data file in bitcask directory", "error", err)
-				openErr = err
-				return
-			}
+			b.activeFileHandle = nil
+			b.ActiveFileID = ""
+			b.ActiveFileSize = 0
+			// if err := b.createNewActiveFile(); err != nil {
+			// 	slog.Error("failed to create new data file in bitcask directory", "error", err)
+			// 	openErr = err
+			// 	return
+			// }
 		} else {
 
 			if err := b.initializeKeydir(files); err != nil {
@@ -78,13 +81,23 @@ func (b *Bitcask) Open() error {
 
 			latestFile := files[len(files)-1]
 
-			b.counter, err = b.getCountFromFileName(latestFile.Name())
-
-			if err := b.createNewActiveFile(); err != nil {
-				slog.Error("failed to create new data file in bitcask directory", "error", err)
+			newCounter, err := b.getCountFromFileName(latestFile.Name())
+			if err != nil {
+				slog.Error("failed to get latest counter for file", "file_name", latestFile.Name(), "error", err)
 				openErr = err
 				return
 			}
+
+			b.counter = newCounter
+			b.activeFileHandle = nil
+			b.ActiveFileID = ""
+			b.ActiveFileSize = 0
+
+			// if err := b.createNewActiveFile(); err != nil {
+			// 	slog.Error("failed to create new data file in bitcask directory", "error", err)
+			// 	openErr = err
+			// 	return
+			// }
 		}
 	})
 
@@ -181,7 +194,9 @@ func (b *Bitcask) Merge() error {
 	newMergeFiles := make(map[string]struct{})
 
 	var mergeFileHandle *os.File
+	var hintFileHandle *os.File
 	currentMergeFileName := fmt.Sprintf("%020d.data", latestCounter)
+	var currentHintFileName string
 	var currentMergeFileSize int64
 
 	for key, entry := range b.keydir {
@@ -217,6 +232,10 @@ func (b *Bitcask) Merge() error {
 				mergeFileHandle.Close()
 			}
 
+			if hintFileHandle != nil {
+				hintFileHandle.Close()
+			}
+
 			currentMergeFileName = fmt.Sprintf("%020d.data", latestCounter)
 
 			fh, err := os.OpenFile(
@@ -225,6 +244,14 @@ func (b *Bitcask) Merge() error {
 				0644,
 			)
 			if err != nil {
+				slog.Error("failed to create merge file handle", "file_name", currentMergeFileName, "error", err)
+				return err
+			}
+
+			currentHintFileName = strings.Replace(currentMergeFileName, ".data", ".hint", 1)
+			hintFileHandle, err = os.OpenFile(filepath.Join(b.dirPath, currentHintFileName), os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+			if err != nil {
+				slog.Error("failed to create merge file handle", "file_name", currentHintFileName, "error", err)
 				return err
 			}
 
@@ -248,6 +275,11 @@ func (b *Bitcask) Merge() error {
 
 		currentMergeFileSize += written
 		newKeyDir.Set(key, newEntry)
+
+		err = writeHintEntry(hintFileHandle, key, newEntry)
+		if err != nil {
+			slog.Error("failed to write to hint file")
+		}
 	}
 
 	for _, fileHandle := range openFileHandles {
@@ -256,6 +288,10 @@ func (b *Bitcask) Merge() error {
 
 	if mergeFileHandle != nil {
 		mergeFileHandle.Close()
+	}
+
+	if hintFileHandle != nil {
+		hintFileHandle.Close()
 	}
 
 	allDataFiles, err := listDataFiles(b.dirPath)
@@ -359,62 +395,109 @@ func (b *Bitcask) initializeKeydir(files []os.DirEntry) error {
 
 	for _, file := range files {
 		var offset int64 = 0
+		hintFileExists := false
+		hintFileReadSuccessful := false
 
-		f, err := os.Open(filepath.Join(b.dirPath, file.Name()))
+		hintFileName := strings.Replace(file.Name(), ".data", ".hint", 1)
+
+		hintFileStat, err := os.Stat(filepath.Join(b.dirPath, hintFileName))
 		if err != nil {
-			slog.Error("failed to read a data file while initializing keydir", "file_name", file.Name(), "error", err)
-			return err
-		}
-
-		// reader := bufio.NewReader(f)
-
-		header := make([]byte, 20)
-		for {
-			_, err := io.ReadFull(f, header)
-			if err == io.EOF || err == io.ErrUnexpectedEOF {
-				break
-			}
-
-			if err != nil {
-				slog.Error("failed to read current buffer in data file", "file_name", file.Name(), "error", err)
-				return err
-			}
-
-			klen := int64(binary.LittleEndian.Uint32(header[12:16]))
-			vlen := int64(binary.LittleEndian.Uint32(header[16:20]))
-
-			keyBuf := make([]byte, klen)
-			if _, err := io.ReadFull(f, keyBuf); err != nil {
-				slog.Error("failed to read key buffer", "file_name", file.Name(), "error", err)
-				return err
-			}
-
-			key := string(keyBuf)
-
-			valueOffset := offset + 20 + klen
-
-			if vlen == 0 {
-				delete(b.keydir, key)
+			if os.IsNotExist(err) {
+				slog.Info("hint file does not exist for a data file, skipping", "data_file", file.Name())
 			} else {
-				b.keydir.Set(key, KeydirEntry{
-					fileID:      file.Name(),
-					valueOffset: valueOffset,
-					valueSize:   vlen,
-					timestamp:   int64(binary.LittleEndian.Uint64(header[4:12])),
-				})
+				slog.Error("failed to read hint file stats")
 			}
+		} else if !hintFileStat.IsDir() {
+			hintFileExists = true
+		}
 
-			slog.Info("SET key in keydir", "key", key)
-
-			if _, err := f.Seek(vlen, io.SeekCurrent); err != nil {
-				slog.Error("failed to skip value offset", "file_name", file.Name(), "error", err)
+		if hintFileExists {
+			f, err := os.Open(filepath.Join(b.dirPath, hintFileName))
+			if err != nil {
+				slog.Error("failed to read a hint file while initializing keydir", "file_name", hintFileName, "error", err)
 				return err
 			}
 
-			offset += 20 + klen + vlen
+			for {
+				key, entry, err := readHintEntry(f, file.Name())
+				if err == io.EOF {
+					hintFileReadSuccessful = true
+					break
+				}
 
+				if err != nil {
+					slog.Error("failed to read hint entry", "file_name", hintFileName, "error", err)
+					break
+				}
+
+				if entry.valueSize == 0 {
+					delete(b.keydir, key)
+				} else {
+					b.keydir.Set(key, entry)
+					slog.Info("setting entry to keydir from hint file", "key", key, "file_name", hintFileName)
+				}
+			}
+
+			f.Close()
 		}
-		f.Close()
+
+		if !hintFileExists || !hintFileReadSuccessful {
+			f, err := os.Open(filepath.Join(b.dirPath, file.Name()))
+			if err != nil {
+				slog.Error("failed to read a data file while initializing keydir", "file_name", file.Name(), "error", err)
+				return err
+			}
+
+			// reader := bufio.NewReader(f)
+
+			header := make([]byte, 20)
+			for {
+				_, err := io.ReadFull(f, header)
+				if err == io.EOF || err == io.ErrUnexpectedEOF {
+					break
+				}
+
+				if err != nil {
+					slog.Error("failed to read current buffer in data file", "file_name", file.Name(), "error", err)
+					return err
+				}
+
+				klen := int64(binary.LittleEndian.Uint32(header[12:16]))
+				vlen := int64(binary.LittleEndian.Uint32(header[16:20]))
+
+				keyBuf := make([]byte, klen)
+				if _, err := io.ReadFull(f, keyBuf); err != nil {
+					slog.Error("failed to read key buffer", "file_name", file.Name(), "error", err)
+					return err
+				}
+
+				key := string(keyBuf)
+
+				valueOffset := offset + 20 + klen
+
+				if vlen == 0 {
+					delete(b.keydir, key)
+				} else {
+					b.keydir.Set(key, KeydirEntry{
+						fileID:      file.Name(),
+						valueOffset: valueOffset,
+						valueSize:   vlen,
+						timestamp:   int64(binary.LittleEndian.Uint64(header[4:12])),
+					})
+				}
+
+				slog.Info("setting entry to keydir from data file", "key", key, "file_name", file.Name())
+
+				if _, err := f.Seek(vlen, io.SeekCurrent); err != nil {
+					slog.Error("failed to skip value offset", "file_name", file.Name(), "error", err)
+					return err
+				}
+
+				offset += 20 + klen + vlen
+
+			}
+			f.Close()
+		}
 
 	}
 
@@ -450,7 +533,97 @@ func (b *Bitcask) appendRecord(key, value string) (KeydirEntry, error) {
 	// }
 
 	// return entry, nil
+
+	if b.activeFileHandle == nil {
+		if err := b.createNewActiveFile(); err != nil {
+			slog.Error("failed to create an active data file in bitcask directory", "error", err)
+			return KeydirEntry{}, err
+		}
+	}
+
 	ts := time.Now().UnixNano()
-	entry, _, err := writeRecord(b.activeFileHandle, b.ActiveFileID, b.ActiveFileSize, ts, key, value)
-	return entry, err
+	entry, written, err := writeRecord(b.activeFileHandle, b.ActiveFileID, b.ActiveFileSize, ts, key, value)
+
+	if err != nil {
+		slog.Error("failed to append record to data file", "file_name", b.ActiveFileID, "error", err)
+		return KeydirEntry{}, err
+	}
+
+	b.ActiveFileSize += written
+
+	return entry, nil
+}
+
+func writeHintEntry(hintFileHandle *os.File, key string, entry KeydirEntry) error {
+
+	keyBytes := []byte(key)
+	keySize := uint32(len(keyBytes))
+
+	//           k      klen       vlen voffset ts
+	totalSize := 4 + len(keyBytes) + 8 + 8 + 8
+	buf := make([]byte, totalSize)
+
+	binary.LittleEndian.PutUint32(buf[0:4], keySize)
+
+	copy(buf[4:4+len(keyBytes)], keyBytes)
+
+	offset := 4 + len(keyBytes)
+
+	binary.LittleEndian.PutUint64(buf[offset:offset+8], uint64(entry.valueSize))
+	offset += 8
+
+	binary.LittleEndian.PutUint64(buf[offset:offset+8], uint64(entry.valueOffset))
+	offset += 8
+
+	binary.LittleEndian.PutUint64(buf[offset:offset+8], uint64(entry.timestamp))
+
+	n, err := hintFileHandle.Write(buf)
+	if err != nil {
+		slog.Error("failed to write hint entry", "error", err)
+		return err
+	}
+
+	if n < len(buf) {
+		slog.Error("partial write detected in hint file")
+		return fmt.Errorf("partial write in hint file")
+	}
+
+	return nil
+}
+
+func readHintEntry(r io.Reader, fileID string) (string, KeydirEntry, error) {
+	var keySize uint32
+
+	if err := binary.Read(r, binary.LittleEndian, &keySize); err != nil {
+		return "", KeydirEntry{}, err
+	}
+
+	keyBuf := make([]byte, keySize)
+	if _, err := io.ReadFull(r, keyBuf); err != nil {
+		return "", KeydirEntry{}, err
+	}
+
+	var valueSize uint64
+	if err := binary.Read(r, binary.LittleEndian, &valueSize); err != nil {
+		return "", KeydirEntry{}, err
+	}
+
+	var valueOffset uint64
+	if err := binary.Read(r, binary.LittleEndian, &valueOffset); err != nil {
+		return "", KeydirEntry{}, err
+	}
+
+	var timestamp uint64
+	if err := binary.Read(r, binary.LittleEndian, &timestamp); err != nil {
+		return "", KeydirEntry{}, err
+	}
+
+	entry := KeydirEntry{
+		fileID:      fileID,
+		valueOffset: int64(valueOffset),
+		valueSize:   int64(valueSize),
+		timestamp:   int64(timestamp),
+	}
+
+	return string(keyBuf), entry, nil
 }
