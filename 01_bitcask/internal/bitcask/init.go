@@ -65,11 +65,6 @@ func (b *Bitcask) Open() error {
 			b.activeFileHandle = nil
 			b.ActiveFileID = ""
 			b.ActiveFileSize = 0
-			// if err := b.createNewActiveFile(); err != nil {
-			// 	slog.Error("failed to create new data file in bitcask directory", "error", err)
-			// 	openErr = err
-			// 	return
-			// }
 		} else {
 
 			if err := b.initializeKeydir(files); err != nil {
@@ -93,12 +88,6 @@ func (b *Bitcask) Open() error {
 			b.activeFileHandle = nil
 			b.ActiveFileID = ""
 			b.ActiveFileSize = 0
-
-			// if err := b.createNewActiveFile(); err != nil {
-			// 	slog.Error("failed to create new data file in bitcask directory", "error", err)
-			// 	openErr = err
-			// 	return
-			// }
 		}
 	})
 
@@ -245,16 +234,6 @@ func (b *Bitcask) fold(fn func(key, value string, acc any) any, initial any) (an
 
 		val := string(valueBuf)
 
-		// val, ok, err := b.Get(k)
-		// if !ok {
-		// 	continue
-		// }
-
-		// if err != nil {
-		// 	slog.Error("failed to read value for key", "key", k, "error", err)
-		// 	return nil, err
-		// }
-
 		accumulator = fn(k, val, accumulator)
 	}
 
@@ -278,9 +257,6 @@ func Fold[T any](b *Bitcask, fn func(key, value string, acc T) T, initial T) (T,
 func (b *Bitcask) Merge() error {
 	b.mutex.Lock()
 	keydirSnapshot := make(Keydir)
-	// for k, v := range b.keydir {
-	// 	keydirSnapshot[k] = v
-	// }
 	maps.Copy(keydirSnapshot, b.keydir)
 	activeID := b.ActiveFileID
 	counter := b.counter
@@ -296,9 +272,6 @@ func (b *Bitcask) Merge() error {
 	defer b.mutex.Unlock()
 
 	for k, entry := range b.keydir {
-		// if v.fileID == activeID {
-		// 	newKeyDir[k] = entry
-		// }
 		if _, isMergeFile := newMergeFiles[entry.fileID]; !isMergeFile {
 			newKeyDir[k] = entry
 		}
@@ -385,10 +358,6 @@ func (b *Bitcask) ensureDirectoryExists() error {
 	return nil
 }
 
-// func (b *Bitcask) newFileID() uint64 {
-// 	return atomic.AddUint64(&b.counter, 1)
-// }
-
 func (b *Bitcask) createNewActiveFile() error {
 
 	if err := b.ensureDirectoryExists(); err != nil {
@@ -397,8 +366,6 @@ func (b *Bitcask) createNewActiveFile() error {
 	}
 
 	b.counter++
-	// fileID := fmt.Sprintf("%020d", b.counter)
-	// fileName := fmt.Sprintf("%s.data", fileID)
 
 	var fileName string
 
@@ -494,8 +461,6 @@ func (b *Bitcask) initializeKeydir(files []os.DirEntry) error {
 				return err
 			}
 
-			// reader := bufio.NewReader(f)
-
 			header := make([]byte, 20)
 			for {
 				_, err := io.ReadFull(f, header)
@@ -551,35 +516,6 @@ func (b *Bitcask) initializeKeydir(files []os.DirEntry) error {
 }
 
 func (b *Bitcask) appendRecord(key, value string) (KeydirEntry, error) {
-	// encodedByte := encodeRecord(key, value, ts)
-
-	// currentOffset := b.ActiveFileSize
-
-	// n, err := b.activeFileHandle.Write(encodedByte)
-	// if err != nil {
-	// 	slog.Error("failed to write to active data file", "error", err)
-	// 	return KeydirEntry{}, err
-	// }
-
-	// if n < len(encodedByte) {
-	// 	if err := b.Close(); err != nil {
-	// 		slog.Error("failed to close current active data file on partial write detection", "error", err)
-	// 	}
-	// 	slog.Error("partial write detected while appending to active data file")
-	// 	return KeydirEntry{}, fmt.Errorf("partial write detected while appending to active data file")
-	// }
-
-	// b.ActiveFileSize += int64(n)
-
-	// entry := KeydirEntry{
-	// 	fileID:      b.ActiveFileID,
-	// 	valueOffset: currentOffset + 20 + int64(len(key)),
-	// 	valueSize:   int64(len(value)),
-	// 	timestamp:   ts,
-	// }
-
-	// return entry, nil
-
 	if b.activeFileHandle == nil {
 		if err := b.createNewActiveFile(); err != nil {
 			slog.Error("failed to create an active data file in bitcask directory", "error", err)
