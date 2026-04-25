@@ -32,5 +32,5 @@ go.work.sum
 # .vscode/
 
 # Bitcask related files
-.data
-.hint
+*.data
+*.hint

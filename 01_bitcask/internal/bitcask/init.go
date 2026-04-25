@@ -185,6 +185,96 @@ func (b *Bitcask) Delete(key string) error {
 	return nil
 }
 
+func (b *Bitcask) ListKeys() []string {
+	b.mutex.RLock()
+	defer b.mutex.RUnlock()
+
+	keys := make([]string, 0, len(b.keydir))
+
+	for k := range b.keydir {
+		keys = append(keys, k)
+	}
+
+	return keys
+}
+
+func (b *Bitcask) fold(fn func(key, value string, acc any) any, initial any) (any, error) {
+	b.mutex.RLock()
+	keydirSnapshot := make(Keydir)
+	maps.Copy(keydirSnapshot, b.keydir)
+	b.mutex.RUnlock()
+
+	accumulator := initial
+	openFileHandles := map[string]*os.File{}
+
+	defer func() {
+		for _, handle := range openFileHandles {
+			handle.Close()
+		}
+	}()
+
+	for k, entry := range keydirSnapshot {
+
+		fileID := entry.fileID
+
+		fileHandle, handleExists := openFileHandles[fileID]
+		if !handleExists {
+			f, err := os.Open(filepath.Join(b.dirPath, fileID))
+			if err != nil {
+				slog.Error("failed to open data file for reading value", "file_id", fileID, "error", err)
+				return nil, err
+			}
+
+			openFileHandles[fileID] = f
+			fileHandle = f
+		}
+
+		valueBuf := make([]byte, entry.valueSize)
+
+		_, err := fileHandle.Seek(entry.valueOffset, io.SeekStart)
+		if err != nil {
+			slog.Error("failed to seek to value offset in data file", "file_id", fileID, "offset", entry.valueOffset, "error", err)
+			return nil, fmt.Errorf("seek failed for file %s at offset %d: %w", fileID, entry.valueOffset, err)
+		}
+
+		_, err = io.ReadFull(fileHandle, valueBuf)
+		if err != nil {
+			slog.Error("failed to read value buffer from data file", "file_id", fileID, "error", err)
+			return nil, err
+		}
+
+		val := string(valueBuf)
+
+		// val, ok, err := b.Get(k)
+		// if !ok {
+		// 	continue
+		// }
+
+		// if err != nil {
+		// 	slog.Error("failed to read value for key", "key", k, "error", err)
+		// 	return nil, err
+		// }
+
+		accumulator = fn(k, val, accumulator)
+	}
+
+	return accumulator, nil
+}
+
+func Fold[T any](b *Bitcask, fn func(key, value string, acc T) T, initial T) (T, error) {
+	acc := initial
+
+	result, err := b.fold(func(key, value string, acc any) any {
+		return fn(key, value, acc.(T))
+	}, acc)
+
+	if err != nil {
+		return acc, err
+	}
+
+	return result.(T), err
+}
+
 func (b *Bitcask) Merge() error {
 	b.mutex.Lock()
 	keydirSnapshot := make(Keydir)
@@ -243,9 +333,25 @@ func (b *Bitcask) Merge() error {
 	return nil
 }
 
+func (b *Bitcask) Sync() error {
+	b.mutex.Lock()
+	defer b.mutex.Unlock()
+
+	if b.activeFileHandle == nil {
+		return nil
+	}
+
+	return b.activeFileHandle.Sync()
+}
+
 func (b *Bitcask) Close() error {
 	if b.activeFileHandle == nil {
 		return nil
+	}
+
+	if err := b.activeFileHandle.Sync(); err != nil {
+		slog.Error("failed to sync current active data file", "error", err)
+		return err
 	}
 
 	if err := b.activeFileHandle.Close(); err != nil {
@@ -484,10 +590,16 @@ func (b *Bitcask) appendRecord(key, value string) (KeydirEntry, error) {
 	recordSize := int64(20 + len(key) + len(value))
 
 	if b.ActiveFileSize+recordSize > b.maxFileSize {
+		if err := b.Sync(); err != nil {
+			slog.Error("failed to sync actie data file", "error", err)
+			return KeydirEntry{}, err
+		}
+
 		if err := b.Close(); err != nil {
 			slog.Error("failed to close active data file", "error", err)
 			return KeydirEntry{}, err
 		}
+
 		if err := b.createNewActiveFile(); err != nil {
 			slog.Error("failed to create an active data file in bitcask directory", "error", err)
 			return KeydirEntry{}, err
@@ -594,6 +706,23 @@ func (b *Bitcask) compactSnapshot(snapshot Keydir, activeID string, counter uint
 	var currentHintFileName string
 	var currentMergeFileSize int64
 
+	defer func() {
+		for _, fh := range openFileHandles {
+			fh.Sync()
+			fh.Close()
+		}
+
+		if mergeFileHandle != nil {
+			mergeFileHandle.Sync()
+			mergeFileHandle.Close()
+		}
+
+		if hintFileHandle != nil {
+			hintFileHandle.Sync()
+			hintFileHandle.Close()
+		}
+	}()
+
 	for key, entry := range snapshot {
 		if entry.fileID == activeID {
 			newKeyDir.Set(key, entry)
@@ -622,11 +751,15 @@ func (b *Bitcask) compactSnapshot(snapshot Keydir, activeID string, counter uint
 
 		if mergeFileHandle == nil || currentMergeFileSize >= b.maxFileSize {
 			if mergeFileHandle != nil {
+				mergeFileHandle.Sync()
 				mergeFileHandle.Close()
+				mergeFileHandle = nil
 			}
 
 			if hintFileHandle != nil {
+				hintFileHandle.Sync()
 				hintFileHandle.Close()
+				hintFileHandle = nil
 			}
 
 			currentMergeFileName = fmt.Sprintf("%020d.data", latestCounter)
@@ -679,18 +812,6 @@ func (b *Bitcask) compactSnapshot(snapshot Keydir, activeID string, counter uint
 			slog.Error("failed to write to hint file", "file_name", currentHintFileName, "error", err)
 			return nil, nil, err
 		}
-	}
-
-	for _, fh := range openFileHandles {
-		fh.Close()
-	}
-
-	if mergeFileHandle != nil {
-		mergeFileHandle.Close()
-	}
-
-	if hintFileHandle != nil {
-		hintFileHandle.Close()
 	}
 
 	return newKeyDir, newMergeFiles, nil
