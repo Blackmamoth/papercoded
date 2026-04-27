@@ -282,7 +282,14 @@ func (b *Bitcask) Merge() error {
 	defer b.mutex.Unlock()
 
 	for k, entry := range b.keydir {
-		if _, isMergeFile := newMergeFiles[entry.fileID]; !isMergeFile {
+		snapshotEntry, existedInSnapshot := keydirSnapshot[k]
+
+		if !existedInSnapshot {
+			newKeyDir[k] = entry
+			continue
+		}
+
+		if entry != snapshotEntry {
 			newKeyDir[k] = entry
 		}
 	}
