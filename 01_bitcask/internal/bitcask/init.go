@@ -4,7 +4,6 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
-	"log/slog"
 	"maps"
 	"os"
 	"path/filepath"
@@ -14,9 +13,15 @@ import (
 	"time"
 )
 
+const (
+	KB int64 = 1024
+	MB       = 1024 * KB
+	GB       = 1024 * MB
+)
+
 type Bitcask struct {
 	dirPath          string
-	maxFileSize      int64 // in MB
+	maxFileSize      int64
 	counter          uint64
 	mutex            sync.RWMutex
 	once             sync.Once
@@ -27,9 +32,10 @@ type Bitcask struct {
 }
 
 func NewBitcask(dirPath string, maxFileSize int64) (*Bitcask, error) {
+
 	db := &Bitcask{
 		dirPath:     dirPath,
-		maxFileSize: maxFileSize * 1024 * 1024,
+		maxFileSize: maxFileSize,
 		keydir:      make(Keydir),
 	}
 
@@ -37,7 +43,7 @@ func NewBitcask(dirPath string, maxFileSize int64) (*Bitcask, error) {
 		return nil, err
 	}
 
-	slog.Info("Bitcask instance opened")
+	// slog.Info("Bitcask instance opened")
 
 	return db, nil
 }
@@ -55,7 +61,7 @@ func (b *Bitcask) Open() error {
 
 		files, err := listDataFiles(b.dirPath)
 		if err != nil {
-			slog.Error("failed to list data files from bitcask directory", "error", err)
+			// slog.Error("failed to list data files from bitcask directory", "error", err)
 			openErr = err
 			return
 		}
@@ -68,7 +74,7 @@ func (b *Bitcask) Open() error {
 		} else {
 
 			if err := b.initializeKeydir(files); err != nil {
-				slog.Error("failed to initialize keydir", "error", err)
+				// slog.Error("failed to initialize keydir", "error", err)
 				openErr = err
 				return
 			}
@@ -79,7 +85,7 @@ func (b *Bitcask) Open() error {
 
 			newCounter, err := b.getCountFromFileName(latestFile.Name())
 			if err != nil {
-				slog.Error("failed to get latest counter for file", "file_name", latestFile.Name(), "error", err)
+				// slog.Error("failed to get latest counter for file", "file_name", latestFile.Name(), "error", err)
 				openErr = err
 				return
 			}
@@ -99,16 +105,20 @@ func (b *Bitcask) Put(key, value string) error {
 	b.mutex.Lock()
 	defer b.mutex.Unlock()
 
+	if key == "" {
+		return fmt.Errorf("key cannot be empty")
+	}
+
 	entry, err := b.appendRecord(key, value)
 
 	if err != nil {
-		slog.Error("failed to append record to current active data file", "key", key, "value", value, "active_file_id", b.ActiveFileID)
+		// slog.Error("failed to append record to current active data file", "key", key, "value", value, "active_file_id", b.ActiveFileID)
 		return fmt.Errorf("failed to append record for key %s: %v", key, err)
 	}
 
 	b.keydir.Set(key, entry)
 
-	slog.Info("set key in keydir", "key", key)
+	// slog.Info("set key in keydir", "key", key)
 
 	return nil
 }
@@ -119,7 +129,7 @@ func (b *Bitcask) Get(key string) (string, bool, error) {
 	keydirEntry, ok := b.keydir.Get(key)
 	b.mutex.RUnlock()
 	if !ok {
-		slog.Warn("attempted to GET non-existent key", "key", key)
+		// slog.Warn("attempted to GET non-existent key", "key", key)
 		return "", false, nil
 	}
 
@@ -127,7 +137,7 @@ func (b *Bitcask) Get(key string) (string, bool, error) {
 
 	f, err := os.Open(filepath.Join(b.dirPath, fileID))
 	if err != nil {
-		slog.Error("failed to open data file for reading value", "file_id", fileID, "error", err)
+		// slog.Error("failed to open data file for reading value", "file_id", fileID, "error", err)
 		return "", false, err
 	}
 	defer f.Close()
@@ -136,13 +146,13 @@ func (b *Bitcask) Get(key string) (string, bool, error) {
 
 	_, err = f.Seek(keydirEntry.valueOffset, io.SeekStart)
 	if err != nil {
-		slog.Error("failed to seek to value offset in data file", "file_id", fileID, "offset", keydirEntry.valueOffset, "error", err)
+		// slog.Error("failed to seek to value offset in data file", "file_id", fileID, "offset", keydirEntry.valueOffset, "error", err)
 		return "", false, fmt.Errorf("seek failed for file %s at offset %d: %w", fileID, keydirEntry.valueOffset, err)
 	}
 
 	_, err = io.ReadFull(f, valueBuf)
 	if err != nil {
-		slog.Error("failed to read value buffer from data file", "file_id", fileID, "error", err)
+		// slog.Error("failed to read value buffer from data file", "file_id", fileID, "error", err)
 		return "", false, err
 	}
 
@@ -156,20 +166,20 @@ func (b *Bitcask) Delete(key string) error {
 
 	_, ok := b.keydir.Get(key)
 	if !ok {
-		slog.Error("attempted to delete non-existent key", "key", key)
+		// slog.Error("attempted to delete non-existent key", "key", key)
 		return fmt.Errorf("attempated to delete non-existent key [%s]", key)
 	}
 
 	_, err := b.appendRecord(key, "")
 
 	if err != nil {
-		slog.Error("failed to append record to current active data file", "key", key, "value", "<EMPTY>", "active_file_id", b.ActiveFileID)
+		// slog.Error("failed to append record to current active data file", "key", key, "value", "<EMPTY>", "active_file_id", b.ActiveFileID)
 		return fmt.Errorf("failed to append record for key %s: %v", key, err)
 	}
 
 	delete(b.keydir, key)
 
-	slog.Info("DELETE key from keydir", "key", key)
+	// slog.Info("DELETE key from keydir", "key", key)
 
 	return nil
 }
@@ -210,7 +220,7 @@ func (b *Bitcask) fold(fn func(key, value string, acc any) any, initial any) (an
 		if !handleExists {
 			f, err := os.Open(filepath.Join(b.dirPath, fileID))
 			if err != nil {
-				slog.Error("failed to open data file for reading value", "file_id", fileID, "error", err)
+				// slog.Error("failed to open data file for reading value", "file_id", fileID, "error", err)
 				return nil, err
 			}
 
@@ -222,13 +232,13 @@ func (b *Bitcask) fold(fn func(key, value string, acc any) any, initial any) (an
 
 		_, err := fileHandle.Seek(entry.valueOffset, io.SeekStart)
 		if err != nil {
-			slog.Error("failed to seek to value offset in data file", "file_id", fileID, "offset", entry.valueOffset, "error", err)
+			// slog.Error("failed to seek to value offset in data file", "file_id", fileID, "offset", entry.valueOffset, "error", err)
 			return nil, fmt.Errorf("seek failed for file %s at offset %d: %w", fileID, entry.valueOffset, err)
 		}
 
 		_, err = io.ReadFull(fileHandle, valueBuf)
 		if err != nil {
-			slog.Error("failed to read value buffer from data file", "file_id", fileID, "error", err)
+			// slog.Error("failed to read value buffer from data file", "file_id", fileID, "error", err)
 			return nil, err
 		}
 
@@ -264,7 +274,7 @@ func (b *Bitcask) Merge() error {
 
 	newKeyDir, newMergeFiles, err := b.compactSnapshot(keydirSnapshot, activeID, counter)
 	if err != nil {
-		slog.Error("failed to compact snapshot during merge", "error", err)
+		// slog.Error("failed to compact snapshot during merge", "error", err)
 		return err
 	}
 
@@ -323,12 +333,12 @@ func (b *Bitcask) Close() error {
 	}
 
 	if err := b.activeFileHandle.Sync(); err != nil {
-		slog.Error("failed to sync current active data file", "error", err)
+		// slog.Error("failed to sync current active data file", "error", err)
 		return err
 	}
 
 	if err := b.activeFileHandle.Close(); err != nil {
-		slog.Error("failed to close current active data file", "error", err)
+		// slog.Error("failed to close current active data file", "error", err)
 		return err
 	}
 
@@ -343,15 +353,15 @@ func (b *Bitcask) ensureDirectoryExists() error {
 		if os.IsNotExist(err) {
 			err = os.MkdirAll(b.dirPath, 0755)
 			if err != nil {
-				slog.Error("failed to create bitcask directory", "error", err)
+				// slog.Error("failed to create bitcask directory", "error", err)
 				return err
 			}
 		} else {
-			slog.Error("failed to retrieve stats for bitcask directory", "error", err)
+			// slog.Error("failed to retrieve stats for bitcask directory", "error", err)
 			return err
 		}
 	} else if !info.IsDir() {
-		slog.Error("provided path is not a directory")
+		// slog.Error("provided path is not a directory")
 		return fmt.Errorf("provided path is not a directory")
 	}
 
@@ -361,7 +371,7 @@ func (b *Bitcask) ensureDirectoryExists() error {
 func (b *Bitcask) createNewActiveFile() error {
 
 	if err := b.ensureDirectoryExists(); err != nil {
-		slog.Error("failed to ensure bitcask directory exists", "error", err)
+		// slog.Error("failed to ensure bitcask directory exists", "error", err)
 		return err
 	}
 
@@ -380,7 +390,7 @@ func (b *Bitcask) createNewActiveFile() error {
 
 	file, err := os.OpenFile(filepath.Join(b.dirPath, fileName), os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
 	if err != nil {
-		slog.Error("failed to create new file in bitcask directory", "error", err)
+		// slog.Error("failed to create new file in bitcask directory", "error", err)
 		return err
 	}
 
@@ -397,7 +407,7 @@ func (b *Bitcask) getCountFromFileName(fileName string) (uint64, error) {
 
 	id, err := strconv.ParseUint(name, 10, 64)
 	if err != nil {
-		slog.Error("failed to parse uint file id", "error", err)
+		// slog.Error("failed to parse uint file id", "error", err)
 		return 0, err
 	}
 
@@ -416,9 +426,9 @@ func (b *Bitcask) initializeKeydir(files []os.DirEntry) error {
 		hintFileStat, err := os.Stat(filepath.Join(b.dirPath, hintFileName))
 		if err != nil {
 			if os.IsNotExist(err) {
-				slog.Info("hint file does not exist for a data file, skipping", "data_file", file.Name())
+				// slog.Info("hint file does not exist for a data file, skipping", "data_file", file.Name())
 			} else {
-				slog.Error("failed to read hint file stats")
+				// slog.Error("failed to read hint file stats")
 			}
 		} else if !hintFileStat.IsDir() {
 			hintFileExists = true
@@ -427,7 +437,7 @@ func (b *Bitcask) initializeKeydir(files []os.DirEntry) error {
 		if hintFileExists {
 			f, err := os.Open(filepath.Join(b.dirPath, hintFileName))
 			if err != nil {
-				slog.Error("failed to read a hint file while initializing keydir", "file_name", hintFileName, "error", err)
+				// slog.Error("failed to read a hint file while initializing keydir", "file_name", hintFileName, "error", err)
 				return err
 			}
 
@@ -439,7 +449,7 @@ func (b *Bitcask) initializeKeydir(files []os.DirEntry) error {
 				}
 
 				if err != nil {
-					slog.Error("failed to read hint entry", "file_name", hintFileName, "error", err)
+					// slog.Error("failed to read hint entry", "file_name", hintFileName, "error", err)
 					break
 				}
 
@@ -447,7 +457,7 @@ func (b *Bitcask) initializeKeydir(files []os.DirEntry) error {
 					delete(b.keydir, key)
 				} else {
 					b.keydir.Set(key, entry)
-					slog.Info("setting entry to keydir from hint file", "key", key, "file_name", hintFileName)
+					// slog.Info("setting entry to keydir from hint file", "key", key, "file_name", hintFileName)
 				}
 			}
 
@@ -457,7 +467,7 @@ func (b *Bitcask) initializeKeydir(files []os.DirEntry) error {
 		if !hintFileExists || !hintFileReadSuccessful {
 			f, err := os.Open(filepath.Join(b.dirPath, file.Name()))
 			if err != nil {
-				slog.Error("failed to read a data file while initializing keydir", "file_name", file.Name(), "error", err)
+				// slog.Error("failed to read a data file while initializing keydir", "file_name", file.Name(), "error", err)
 				return err
 			}
 
@@ -469,7 +479,7 @@ func (b *Bitcask) initializeKeydir(files []os.DirEntry) error {
 				}
 
 				if err != nil {
-					slog.Error("failed to read current buffer in data file", "file_name", file.Name(), "error", err)
+					// slog.Error("failed to read current buffer in data file", "file_name", file.Name(), "error", err)
 					return err
 				}
 
@@ -478,7 +488,7 @@ func (b *Bitcask) initializeKeydir(files []os.DirEntry) error {
 
 				keyBuf := make([]byte, klen)
 				if _, err := io.ReadFull(f, keyBuf); err != nil {
-					slog.Error("failed to read key buffer", "file_name", file.Name(), "error", err)
+					// slog.Error("failed to read key buffer", "file_name", file.Name(), "error", err)
 					return err
 				}
 
@@ -497,10 +507,10 @@ func (b *Bitcask) initializeKeydir(files []os.DirEntry) error {
 					})
 				}
 
-				slog.Info("setting entry to keydir from data file", "key", key, "file_name", file.Name())
+				// slog.Info("setting entry to keydir from data file", "key", key, "file_name", file.Name())
 
 				if _, err := f.Seek(vlen, io.SeekCurrent); err != nil {
-					slog.Error("failed to skip value offset", "file_name", file.Name(), "error", err)
+					// slog.Error("failed to skip value offset", "file_name", file.Name(), "error", err)
 					return err
 				}
 
@@ -518,26 +528,28 @@ func (b *Bitcask) initializeKeydir(files []os.DirEntry) error {
 func (b *Bitcask) appendRecord(key, value string) (KeydirEntry, error) {
 	if b.activeFileHandle == nil {
 		if err := b.createNewActiveFile(); err != nil {
-			slog.Error("failed to create an active data file in bitcask directory", "error", err)
+			// slog.Error("failed to create an active data file in bitcask directory", "error", err)
 			return KeydirEntry{}, err
 		}
 	}
 
 	recordSize := int64(20 + len(key) + len(value))
 
-	if b.ActiveFileSize+recordSize > b.maxFileSize {
-		if err := b.Sync(); err != nil {
-			slog.Error("failed to sync actie data file", "error", err)
+	if b.ActiveFileSize+recordSize > b.maxFileSize && b.ActiveFileSize != 0 {
+		if err := b.activeFileHandle.Sync(); err != nil {
+			// slog.Error("failed to sync actie data file", "error", err)
 			return KeydirEntry{}, err
 		}
 
-		if err := b.Close(); err != nil {
-			slog.Error("failed to close active data file", "error", err)
+		if err := b.activeFileHandle.Close(); err != nil {
+			// slog.Error("failed to close active data file", "error", err)
 			return KeydirEntry{}, err
 		}
+
+		b.activeFileHandle = nil
 
 		if err := b.createNewActiveFile(); err != nil {
-			slog.Error("failed to create an active data file in bitcask directory", "error", err)
+			// slog.Error("failed to create an active data file in bitcask directory", "error", err)
 			return KeydirEntry{}, err
 		}
 	}
@@ -546,7 +558,7 @@ func (b *Bitcask) appendRecord(key, value string) (KeydirEntry, error) {
 	entry, written, err := writeRecord(b.activeFileHandle, b.ActiveFileID, b.ActiveFileSize, ts, key, value)
 
 	if err != nil {
-		slog.Error("failed to append record to data file", "file_name", b.ActiveFileID, "error", err)
+		// slog.Error("failed to append record to data file", "file_name", b.ActiveFileID, "error", err)
 		return KeydirEntry{}, err
 	}
 
@@ -580,12 +592,12 @@ func writeHintEntry(hintFileHandle *os.File, key string, entry KeydirEntry) erro
 
 	n, err := hintFileHandle.Write(buf)
 	if err != nil {
-		slog.Error("failed to write hint entry", "error", err)
+		// slog.Error("failed to write hint entry", "error", err)
 		return err
 	}
 
 	if n < len(buf) {
-		slog.Error("partial write detected in hint file")
+		// slog.Error("partial write detected in hint file")
 		return fmt.Errorf("partial write in hint file")
 	}
 
@@ -706,7 +718,7 @@ func (b *Bitcask) compactSnapshot(snapshot Keydir, activeID string, counter uint
 				0644,
 			)
 			if err != nil {
-				slog.Error("failed to create merge file handle", "file_name", currentMergeFileName, "error", err)
+				// slog.Error("failed to create merge file handle", "file_name", currentMergeFileName, "error", err)
 				return nil, nil, err
 			}
 
@@ -718,7 +730,7 @@ func (b *Bitcask) compactSnapshot(snapshot Keydir, activeID string, counter uint
 				0644,
 			)
 			if err != nil {
-				slog.Error("failed to create hint file handle", "file_name", currentHintFileName, "error", err)
+				// slog.Error("failed to create hint file handle", "file_name", currentHintFileName, "error", err)
 				return nil, nil, err
 			}
 
@@ -745,7 +757,7 @@ func (b *Bitcask) compactSnapshot(snapshot Keydir, activeID string, counter uint
 		newKeyDir.Set(key, newEntry)
 
 		if err := writeHintEntry(hintFileHandle, key, newEntry); err != nil {
-			slog.Error("failed to write to hint file", "file_name", currentHintFileName, "error", err)
+			// slog.Error("failed to write to hint file", "file_name", currentHintFileName, "error", err)
 			return nil, nil, err
 		}
 	}
